@@ -1,0 +1,286 @@
+
+import java.util.List;
+import java.util.Objects;
+import java.util.Random;
+import java.util.UUID;
+import java.util.concurrent.*;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+
+/**
+*  通过Trae自动生成的答案
+**/
+
+public class FutureAnswer {
+
+    // You have a process gets a request, does some calculations, writes the results to a database
+    // and then commits the data.
+    // You have access to a client that performs the calculation (CalculationClient)
+    // and another that writes to the database (DatabaseClient)
+
+    public static void main(String[] args) throws Exception {
+        CalcuationRequest calcRequest = generateCalculationRequest(101);
+        DatabaseClient dbClient = new DatabaseClient();
+        CalculationClient calcClient = new CalculationClient();
+        try {
+            processRequest(dbClient, calcClient, calcRequest);
+        } finally {
+            dbClient.scheduler.shutdown();
+            calcClient.scheduler.shutdown();
+        }
+        System.out.println("Finished");
+    }
+    public static void processRequest(DatabaseClient dbClient, CalculationClient calcClient, CalcuationRequest calcRequest) throws ExecutionException, InterruptedException {
+        // 重试配置参数
+        final int MAX_RETRIES = 3;
+        final long INITIAL_DELAY_MS = 1000;
+        
+        // 1. 开始数据库事务（带重试）
+        retry(() -> dbClient.startTransaction(), "startTransaction", MAX_RETRIES, INITIAL_DELAY_MS)
+                // 2. 事务成功后，并行执行所有计算请求
+                .thenCompose(transactionReport -> {
+                    String transactionId = transactionReport.getTransactionId();
+                    System.out.println("Transaction started with ID: " + transactionId);
+                    
+                    // 并行执行所有计算请求
+                    List<CompletableFuture<SubCalculationResult>> calculationFutures = calcRequest.getCalculationRequests()
+                            .stream()
+                            .map(calcClient::calculate)
+                            .collect(Collectors.toList());
+                    
+                    // 等待所有计算完成
+                    CompletableFuture<Void> allCalculationsDone = CompletableFuture.allOf(
+                            calculationFutures.toArray(new CompletableFuture[0])
+                    );
+                    
+                    // 收集所有计算结果
+                    return allCalculationsDone.thenApply(v -> {
+                        List<SubCalculationResult> results = calculationFutures.stream()
+                                .map(CompletableFuture::join)
+                                .collect(Collectors.toList());
+                        return new CalculationResults(transactionId, results);
+                    });
+                })
+                // 3. 计算完成后，将所有结果写入数据库（每个写入操作都带重试）
+                .thenCompose(calculationResults -> {
+                    String transactionId = calculationResults.transactionId;
+                    List<SubCalculationResult> results = calculationResults.results;
+                    
+                    // 并行将结果写入数据库，每个写入操作都带重试
+                    List<CompletableFuture<OperationReport>> writeFutures = results.stream()
+                            .map(result -> retry(() -> dbClient.writeToDatabase(result, transactionId), 
+                                            "writeToDatabase", MAX_RETRIES, INITIAL_DELAY_MS))
+                            .collect(Collectors.toList());
+                    
+                    // 等待所有写入完成
+                    return CompletableFuture.allOf(writeFutures.toArray(new CompletableFuture[0]))
+                            .thenApply(v -> transactionId);
+                })
+                // 4. 所有写入完成后，提交事务（带重试）
+                .thenCompose(transactionId -> retry(() -> dbClient.commitTransaction(transactionId), 
+                                "commitTransaction", MAX_RETRIES, INITIAL_DELAY_MS))
+                // 处理成功情况
+                .thenAccept(commitReport -> {
+                    System.out.println("Transaction committed successfully: " + commitReport.getTransactionId());
+                })
+                // 处理异常情况
+                .exceptionally(ex -> {
+                    System.err.println("Error processing request: " + ex.getMessage());
+                    ex.printStackTrace();
+                    return null;
+                })
+                // 等待整个流程完成
+                .join();
+    }
+
+    // 通用重试方法，支持CompletableFuture操作的重试
+    private static <T> CompletableFuture<T> retry(Supplier<CompletableFuture<T>> operation, String operationName, int maxRetries, long initialDelayMs) {
+        return retryHelper(operation, operationName, maxRetries, initialDelayMs, 0);
+    }
+
+    // 重试辅助方法，递归实现指数退避重试
+    private static <T> CompletableFuture<T> retryHelper(Supplier<CompletableFuture<T>> operation, String operationName, int maxRetries, long initialDelayMs, int retryCount) {
+        CompletableFuture<T> future = operation.get();
+
+        // 如果失败且还有重试次数，进行重试
+        return future.exceptionally(ex -> {
+            if (retryCount < maxRetries) {
+                long delay = initialDelayMs * (long) Math.pow(2, retryCount); // 指数退避
+                System.out.printf("Operation %s failed (attempt %d/%d). Retrying in %d ms... Error: %s%n",
+                        operationName, retryCount + 1, maxRetries, delay, ex.getMessage());
+
+                // 创建一个延迟的CompletableFuture作为重试的触发器
+                CompletableFuture<Void> delayFuture = new CompletableFuture<>();
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        Thread.sleep(delay);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        delayFuture.completeExceptionally(e);
+                        return;
+                    }
+                    delayFuture.complete(null);
+                });
+
+                // 延迟后递归调用重试辅助方法
+                return delayFuture.thenCompose(v -> retryHelper(operation, operationName, maxRetries, initialDelayMs, retryCount + 1))
+                        .join(); // 使用join()获取结果，因为我们在exceptionally的上下文中
+            } else {
+                // 达到最大重试次数，抛出异常
+                System.err.printf("Operation %s failed after %d attempts. Error: %s%n",
+                        operationName, maxRetries, ex.getMessage());
+                throw new CompletionException(ex);
+            }
+        });
+    }
+    
+    // 辅助类，用于传递事务ID和计算结果
+    private static class CalculationResults {
+        private final String transactionId;
+        private final List<SubCalculationResult> results;
+        
+        public CalculationResults(String transactionId, List<SubCalculationResult> results) {
+            this.transactionId = transactionId;
+            this.results = results;
+        }
+    }
+    public static class DatabaseClient {
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(10);
+        public CompletableFuture<OperationReport> startTransaction() {
+            Random random = new Random();
+            int delay = 1 + random.nextInt(10);
+            boolean isFailure = random.nextInt(100) > 96;
+            CompletableFuture<OperationReport> future = new CompletableFuture<>();
+            scheduler.schedule(() -> {
+                if(isFailure){
+                    future.completeExceptionally(new Exception("Failed because you were unlucky!"));
+                } else {
+                    String transactionId = UUID.randomUUID().toString();
+                    System.out.println("Opened transaction: " + transactionId);
+                    future.complete(new OperationReport(transactionId));
+                }
+            }, delay, TimeUnit.SECONDS);
+            return future;
+        }
+        public CompletableFuture<OperationReport> writeToDatabase(SubCalculationResult result, String transactionId) {
+            Random random = new Random();
+            int delay = 1 + random.nextInt(10);
+            boolean isFailure = random.nextInt(100) > 96;
+            CompletableFuture<OperationReport> future = new CompletableFuture<>();
+            scheduler.schedule(() -> {
+                if(isFailure){
+                    future.completeExceptionally(new Exception("Failed because you were unlucky!"));
+                } else {
+                    System.out.println("Wrote result " + result.getResultId() + " to transaction " + transactionId);
+                    future.complete(new OperationReport(transactionId));
+                }
+            }, delay, TimeUnit.SECONDS);
+            return future;
+        }
+        public CompletableFuture<OperationReport>  commitTransaction(String transactionId){
+            Random random = new Random();
+            int delay = 1 + random.nextInt(10);
+            boolean isFailure = random.nextInt(100) > 96;
+            CompletableFuture<OperationReport> future = new CompletableFuture<>();
+            scheduler.schedule(() -> {
+                if(isFailure){
+                    future.completeExceptionally(new Exception("Failed because you were unlucky!"));
+                } else {
+                    future.complete(new OperationReport(transactionId));
+                }
+            }, delay, TimeUnit.SECONDS);
+            return future;
+        }
+    }
+
+    public static class OperationReport {
+        private boolean isSuccessful;
+        private String error;
+        private String transactionId;
+        public OperationReport(String transactionId) {
+            this.transactionId = transactionId;
+//            this.isSuccessful = true;
+        }
+        public String getTransactionId(){
+            return transactionId;
+        }
+    }
+    public static class CalculationClient {
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(10);
+        public CompletableFuture<SubCalculationResult> calculate(SubCalculationRequest request) {
+            Random random = new Random();
+            int delay = 1 + random.nextInt(10);
+            CompletableFuture<SubCalculationResult> future = new CompletableFuture<>();
+            scheduler.schedule(() -> {
+                future.complete(fromSubCalculationRequest(request));
+            }, delay, TimeUnit.SECONDS);
+            return future;
+        }
+    }
+    public static class CalcuationRequest {
+        private String requestId;
+        private List<SubCalculationRequest> calculationRequests;
+        public CalcuationRequest(String requestId, List<SubCalculationRequest> calculationRequests) {
+            this.requestId = requestId;
+            this.calculationRequests = calculationRequests;
+        }
+        public String getRequestId() {
+            return requestId;
+        }
+        public List<SubCalculationRequest> getCalculationRequests() {
+            return calculationRequests;
+        }
+    }
+    public static class SubCalculationRequest {
+        private String subRequestId;
+        private String calculationType;
+        private String calculationData;
+        public SubCalculationRequest(String subRequestId, String calculationType, String calculationData) {
+            this.subRequestId = subRequestId;
+            this.calculationType = calculationType;
+            this.calculationData = calculationData;
+        }
+        // Getters and Setters
+        public String getSubRequestId() {
+            return subRequestId;
+        }
+        public String getCalculationType() {
+            return calculationType;
+        }
+        public String getCalculationData() {
+            return calculationData;
+        }
+    }
+    public static class SubCalculationResult {
+        private String requestId;
+        private String resultId;
+        private String resultData;
+        public SubCalculationResult(String requestId, String resultId, String resultData) {
+            this.requestId = requestId;
+            this.resultId = resultId;
+            this.resultData = resultData;
+        }
+        // Getters and Setters
+        public String getRequestId() {
+            return requestId;
+        }
+        public String getResultId() {
+            return resultId;
+        }
+        public String getResultData() {
+            return resultData;
+        }
+    }
+    private static CalcuationRequest generateCalculationRequest(int numOfSubRequests){
+        List<SubCalculationRequest> subCalculationRequests = IntStream.range(1,numOfSubRequests).mapToObj(i -> new SubCalculationRequest("subRequestId"+i,
+                "calculationType"+i, "calculationData" + i)).collect(Collectors.toList());
+        return new CalcuationRequest("requestId", subCalculationRequests);
+    }
+    private static SubCalculationResult fromSubCalculationRequest(SubCalculationRequest subCalculationRequest){
+        return new SubCalculationResult(subCalculationRequest.getSubRequestId(), subCalculationRequest.getSubRequestId(), subCalculationRequest.getCalculationData());
+    }
+
+}
